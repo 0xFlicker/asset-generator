@@ -1,49 +1,106 @@
-import type { RequestHandler, Response } from "express";
-import type { NextApiResponse } from "next";
+import AWS from "aws-sdk";
 import { Canvas } from "canvas";
-import { utils } from "ethers";
 import {
   generateAxolotlValleyFromSeed,
   renderCanvas,
 } from "@creaturenft/assets";
-import type { ChildCreatureERC721 } from "@creaturenft/contracts";
-import { defaultServerError, notFoundError } from "../utils/error.js";
+import { ChildCreatureERC721__factory } from "@creaturenft/contracts";
+import { defaultProvider, networkStringToNetworkType } from "@creaturenft/web3";
+import { utils } from "ethers";
 
-export async function handleImage(
-  tokenId: string,
-  childContract: ChildCreatureERC721,
-  res: Response | NextApiResponse
-) {
+const network = networkStringToNetworkType(process.env.NETWORK);
+const provider = defaultProvider(network);
+
+const creatureContract = ChildCreatureERC721__factory.connect(
+  process.env.CHILD_CREATURE_ERC721_ADDRESS,
+  provider
+);
+const s3 = new AWS.S3();
+
+/**
+ *
+ * @param key {string}
+ * @returns {Promise<boolean>}
+ */
+async function s3Exists(key) {
+  const params = {
+    Bucket: process.env.ASSET_BUCKET,
+    Key: key,
+  };
   try {
-    // TODO: check if tokenId is a valid tokenId
-    // TODO: put behind a cache
-    const tokenCount = await childContract.tokenCount();
-    if (tokenCount.lt(tokenId)) {
-      return notFoundError(res);
-    }
-    const seed = await childContract.seed(tokenId);
+    const data = await s3.headObject(params).promise();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
 
-    // TODO: Check if image exists in bucket and return it
+/**
+ *
+ * @param key {string}
+ * @param imageData {Buffer}
+ * @returns {Promise<void>}
+ */
+async function s3WriteObject(key, imageData) {
+  const params = {
+    Bucket: process.env.ASSET_BUCKET,
+    Key: key,
+    Body: imageData,
+    ACL: "public-read",
+    ContentDisposition: "inline",
+    ContentType: "image/png",
+  };
+  await s3.putObject(params).promise();
+}
+
+// Handler
+export async function handler(event, context) {
+  const {
+    pathParameters: { tokenId: tokenIdStr },
+    requestContext: { stage },
+  } = event;
+  const tokenId = parseInt(tokenIdStr);
+  if (!Number.isInteger(tokenId)) {
+    return {
+      statusCode: 400,
+      body: "Token ID must be an integer",
+    };
+  }
+  if (tokenId < 0) {
+    return {
+      statusCode: 400,
+      body: "Token ID must be greater than 0",
+    };
+  }
+
+  const tokenCount = await creatureContract.tokenCount();
+  if (tokenCount.lt(tokenId)) {
+    return {
+      statusCode: 400,
+      body: `Token ID must be less than ${tokenCount.toString()}`,
+    };
+  }
+  const seed = await creatureContract.seed(tokenId);
+
+  const exists = await s3Exists(`${stage}/image/${seed}.png`);
+
+  if (!exists) {
     // From seed, generate layers
     const { layers } = generateAxolotlValleyFromSeed(utils.arrayify(seed));
 
     // Render canvas
     const canvas = new Canvas(569, 569);
     await renderCanvas(canvas, layers);
-    res.setHeader("Content-Type", "image/png");
 
-    // Send image as buffer
-    res.status(200).send(canvas.toBuffer());
-  } catch (err: any) {
-    defaultServerError(res, err);
+    // Save canvas to S3
+    const imageData = canvas.toBuffer();
+    await s3WriteObject(`${stage}/image/${seed}.png`, imageData);
   }
-}
 
-export function createGetImageHandler(childContract: ChildCreatureERC721) {
-  const getMetadata: RequestHandler<{ id: string }> = async (req, res) => {
-    const { id: tokenId } = req.params;
-    return await handleImage(tokenId, childContract, res);
+  return {
+    statusCode: 301,
+    headers: {
+      Location: `${process.env.ASSET_URL}/${stage}/image/${seed}.png`,
+    },
   };
-
-  return getMetadata;
 }
